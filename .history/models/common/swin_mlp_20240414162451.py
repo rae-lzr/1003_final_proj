@@ -585,7 +585,7 @@ class SwinMLP(nn.Module):
 
     def train(self, mode=True):
         """Convert the model into training mode while keep layers freezed."""
-        super(SwinMLP, self).train(mode)
+        super(SwinTransformer, self).train(mode)
         self._freeze_stages()
 
     # not working in the current version
@@ -600,7 +600,7 @@ class SwinMLP(nn.Module):
     
 def swin_base_win7_384(pretrained=None, pos_dim=1024, **kwargs):
     pos_dim = 1024 if pos_dim is None else pos_dim
-    model = SwinMLP(pretrain_img_size=[384, 384],
+    model = SwinTransformer(pretrain_img_size=[384, 384],
                             embed_dim=128,
                             depths=[2, 2, 18, 2],
                             num_heads=[4, 8, 16, 32],
