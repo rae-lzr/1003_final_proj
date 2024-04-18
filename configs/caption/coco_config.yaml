@@ -2,8 +2,8 @@ exp:
   seed: 42
   name: eval
   rank: 0
-  ngpus_per_node: 8
-  world_size: 8
+  ngpus_per_node: 1
+  world_size: 1
   checkpoint: ''
   eval: False
   resume: False
