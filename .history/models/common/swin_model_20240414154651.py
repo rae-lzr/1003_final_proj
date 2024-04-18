@@ -185,55 +185,69 @@ class WindowAttention(nn.Module):
         x = self.proj_drop(x)
         return x
 
-class SwinMLPBlock(nn.Module):
-    r""" Swin MLP Block.
 
-    Args:
-        dim (int): Number of input channels.
-        input_resolution (tuple[int]): Input resulotion.
-        num_heads (int): Number of attention heads.
-        window_size (int): Window size.
-        shift_size (int): Shift size for SW-MSA.
-        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
-        drop (float, optional): Dropout rate. Default: 0.0
-        drop_path (float, optional): Stochastic depth rate. Default: 0.0
-        act_layer (nn.Module, optional): Activation layer. Default: nn.GELU
-        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
-    """
+class SwinTransformerBlock(nn.Module):
 
-    def __init__(self, dim, num_heads, window_size=7, shift_size=0,
-                 mlp_ratio=4., drop=0., drop_path=0.,
-                 act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+    def __init__(self,
+                 dim,
+                 num_heads,
+                 window_size=7,
+                 shift_size=0,
+                 mlp_ratio=4.,
+                 qkv_bias=True,
+                 qk_scale=None,
+                 drop=0.,
+                 attn_drop=0.,
+                 drop_path=0.,
+                 act_layer=nn.GELU,
+                 norm_layer=nn.LayerNorm):
+        """
+        Args:
+            dim (int): Number of input channels.
+            num_heads (int): Number of attention heads.
+            window_size (int): Window size.
+            shift_size (int): Shift size for SW-MSA.
+            mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
+            qkv_bias (bool, optional): If True, add a learnable bias to query, key, value.
+            qk_scale (float | None, optional): Override default qk scale of head_dim ** -0.5 if set.
+            drop (float, optional): Dropout rate. Default: 0.0
+            attn_drop (float, optional): Attention dropout rate. Default: 0.0
+            drop_path (float, optional): Stochastic depth rate. Default: 0.0
+            act_layer (nn.Module, optional): Activation layer. Default: nn.GELU
+            norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
+        """
         super().__init__()
         self.dim = dim
-        # self.input_resolution = input_resolution
         self.num_heads = num_heads
         self.window_size = window_size
         self.shift_size = shift_size
         self.mlp_ratio = mlp_ratio
-        if min(self.input_resolution) <= self.window_size:
-            # if window size is larger than input resolution, we don't partition windows
-            self.shift_size = 0
-            self.window_size = min(self.input_resolution)
         assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
 
-        self.padding = [self.window_size - self.shift_size, self.shift_size,
-                        self.window_size - self.shift_size, self.shift_size]  # P_l,P_r,P_t,P_b
-
         self.norm1 = norm_layer(dim)
-        # use group convolution to implement multi-head MLP
-        self.spatial_mlp = nn.Conv1d(self.num_heads * self.window_size ** 2,
-                                     self.num_heads * self.window_size ** 2,
-                                     kernel_size=1,
-                                     groups=self.num_heads)
+        self.attn = WindowAttention(dim,
+                                    window_size=to_2tuple(self.window_size),
+                                    num_heads=num_heads,
+                                    qkv_bias=qkv_bias,
+                                    qk_scale=qk_scale,
+                                    attn_drop=attn_drop,
+                                    proj_drop=drop)
 
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
-    def forward(self, x):
-        # H, W = self.input_resolution
+        self.H = None
+        self.W = None
+
+    def forward(self, x, mask_matrix):
+        """
+        Args:
+            x: Input feature, tensor size (B, H*W, C).
+            H, W: Spatial resolution of the input feature.
+            mask_matrix: Attention mask for cyclic shift.
+        """
         B, L, C = x.shape
         H, W = self.H, self.W
         assert L == H * W, "input feature has wrong size"
@@ -242,38 +256,41 @@ class SwinMLPBlock(nn.Module):
         x = self.norm1(x)
         x = x.view(B, H, W, C)
 
-        # shift
+        # pad feature maps to multiples of window size
+        pad_l = pad_t = 0
+        pad_r = (self.window_size - W % self.window_size) % self.window_size
+        pad_b = (self.window_size - H % self.window_size) % self.window_size
+        x = F.pad(x, (0, 0, pad_l, pad_r, pad_t, pad_b))
+        _, Hp, Wp, _ = x.shape
+
+        # cyclic shift
         if self.shift_size > 0:
-            P_l, P_r, P_t, P_b = self.padding
-            shifted_x = F.pad(x, [0, 0, P_l, P_r, P_t, P_b], "constant", 0)
+            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+            attn_mask = mask_matrix
         else:
             shifted_x = x
-        _, _H, _W, _ = shifted_x.shape
+            attn_mask = None
 
         # partition windows
         x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
         x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
 
-        # Window/Shifted-Window Spatial MLP
-        x_windows_heads = x_windows.view(-1, self.window_size * self.window_size, self.num_heads, C // self.num_heads)
-        x_windows_heads = x_windows_heads.transpose(1, 2)  # nW*B, nH, window_size*window_size, C//nH
-        x_windows_heads = x_windows_heads.reshape(-1, self.num_heads * self.window_size * self.window_size,
-                                                  C // self.num_heads)
-        spatial_mlp_windows = self.spatial_mlp(x_windows_heads)  # nW*B, nH*window_size*window_size, C//nH
-        spatial_mlp_windows = spatial_mlp_windows.view(-1, self.num_heads, self.window_size * self.window_size,
-                                                       C // self.num_heads).transpose(1, 2)
-        spatial_mlp_windows = spatial_mlp_windows.reshape(-1, self.window_size * self.window_size, C)
+        # W-MSA/SW-MSA
+        attn_windows = self.attn(x_windows, mask=attn_mask)  # nW*B, window_size*window_size, C
 
         # merge windows
-        spatial_mlp_windows = spatial_mlp_windows.reshape(-1, self.window_size, self.window_size, C)
-        shifted_x = window_reverse(spatial_mlp_windows, self.window_size, _H, _W)  # B H' W' C
+        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
+        shifted_x = window_reverse(attn_windows, self.window_size, Hp, Wp)  # B H' W' C
 
-        # reverse shift
+        # reverse cyclic shift
         if self.shift_size > 0:
-            P_l, P_r, P_t, P_b = self.padding
-            x = shifted_x[:, P_t:-P_b, P_l:-P_r, :].contiguous()
+            x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
         else:
             x = shifted_x
+
+        if pad_r > 0 or pad_b > 0:
+            x = x[:, :H, :W, :].contiguous()
+
         x = x.view(B, H * W, C)
 
         # FFN
@@ -281,6 +298,7 @@ class SwinMLPBlock(nn.Module):
         x = x + self.drop_path(self.mlp(self.norm2(x)))
 
         return x
+
 
 class PatchMerging(nn.Module):
     
@@ -330,43 +348,62 @@ class PatchMerging(nn.Module):
         x = self.reduction(x)
         return x
 
+
 class BasicLayer(nn.Module):
-    """ A basic Swin MLP layer for one stage.
 
-    Args:
-        dim (int): Number of input channels.
-        input_resolution (tuple[int]): Input resolution.
-        depth (int): Number of blocks.
-        num_heads (int): Number of attention heads.
-        window_size (int): Local window size.
-        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
-        drop (float, optional): Dropout rate. Default: 0.0
-        drop_path (float | tuple[float], optional): Stochastic depth rate. Default: 0.0
-        norm_layer (nn.Module, optional): Normalization layer. Default: nn.LayerNorm
-        downsample (nn.Module | None, optional): Downsample layer at the end of the layer. Default: None
-        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False.
-    """
-
-    def __init__(self, dim, depth, num_heads, window_size,
-                 mlp_ratio=4., drop=0., drop_path=0.,
-                 norm_layer=nn.LayerNorm, downsample=None, last=False, use_checkpoint=False):
+    def __init__(self,
+                 dim,
+                 depth,
+                 num_heads,
+                 window_size=7,
+                 mlp_ratio=4.,
+                 qkv_bias=True,
+                 qk_scale=None,
+                 drop=0.,
+                 attn_drop=0.,
+                 drop_path=0.,
+                 norm_layer=nn.LayerNorm,
+                 downsample=None,
+                 last=False,
+                 use_checkpoint=False):
+        """
+        Args:
+            dim (int): Number of feature channels
+            depth (int): Depths of this stage.
+            num_heads (int): Number of attention head.
+            window_size (int): Local window size. Default: 7.
+            mlp_ratio (float): Ratio of mlp hidden dim to embedding dim. Default: 4.
+            qkv_bias (bool, optional): If True, add a learnable bias to query, key, value. Default: True
+            qk_scale (float | None, optional): Override default qk scale of head_dim ** -0.5 if set.
+            drop (float, optional): Dropout rate. Default: 0.0
+            attn_drop (float, optional): Attention dropout rate. Default: 0.0
+            drop_path (float | tuple[float], optional): Stochastic depth rate. Default: 0.0
+            norm_layer (nn.Module, optional): Normalization layer. Default: nn.LayerNorm
+            downsample (nn.Module | None, optional): Downsample layer at the end of the layer. Default: None
+            use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False.
+        """
 
         super().__init__()
-        self.dim = dim
-        # self.input_resolution = input_resolution
+        self.window_size = window_size
+        self.shift_size = window_size // 2
         self.depth = depth
+        self.dim = dim
         self.use_checkpoint = use_checkpoint
 
         # build blocks
         self.blocks = nn.ModuleList([
-            SwinMLPBlock(dim=dim,
-                         num_heads=num_heads, window_size=window_size,
-                         shift_size=0 if (i % 2 == 0) else window_size // 2,
-                         mlp_ratio=mlp_ratio,
-                         drop=drop,
-                         drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
-                         norm_layer=norm_layer)
-            for i in range(depth)])
+            SwinTransformerBlock(dim=dim,
+                                 num_heads=num_heads,
+                                 window_size=window_size,
+                                 shift_size=0 if (i % 2 == 0) else window_size // 2,
+                                 mlp_ratio=mlp_ratio,
+                                 qkv_bias=qkv_bias,
+                                 qk_scale=qk_scale,
+                                 drop=drop,
+                                 attn_drop=attn_drop,
+                                 drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
+                                 norm_layer=norm_layer) for i in range(depth)
+        ])
 
         # patch merging layer
         if downsample is not None:
@@ -383,12 +420,32 @@ class BasicLayer(nn.Module):
 
         B = x.shape[0]
 
+        # calculate attention mask for SW-MSA
+        Hp = int(np.ceil(H / self.window_size)) * self.window_size
+        Wp = int(np.ceil(W / self.window_size)) * self.window_size
+        img_mask = torch.zeros((1, Hp, Wp, 1), device=x.device)  # 1 Hp Wp 1
+        h_slices = (slice(0, -self.window_size), slice(-self.window_size,
+                                                       -self.shift_size), slice(-self.shift_size, None))
+        w_slices = (slice(0, -self.window_size), slice(-self.window_size,
+                                                       -self.shift_size), slice(-self.shift_size, None))
+        cnt = 0
+        for h in h_slices:
+            for w in w_slices:
+                img_mask[:, h, w, :] = cnt
+                cnt += 1
+
+        # mask for cyclic shift
+        mask_windows = window_partition(img_mask, self.window_size)
+        mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
+        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+        attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+
         for n_blk, blk in enumerate(self.blocks):
             blk.H, blk.W = H, W
             if self.use_checkpoint:
-                x = checkpoint.checkpoint(blk, x)
+                x = checkpoint.checkpoint(blk, x, attn_mask)
             else:
-                x = blk(x)
+                x = blk(x, attn_mask)
 
         # reduce the number of tokens and increase the channel dim by a factor of 2
         if self.downsample is not None:
@@ -397,7 +454,8 @@ class BasicLayer(nn.Module):
             return x, H, W, x_down, Wh, Ww
         else:
             return x, H, W, x, H, W
-    
+
+
 class PatchEmbed(nn.Module):
     
     def __init__(self, patch_size=4, in_chans=3, embed_dim=96, norm_layer=None):
@@ -440,39 +498,65 @@ class PatchEmbed(nn.Module):
 
         return x
 
-class SwinMLP(nn.Module):
-    r""" Swin MLP
+
+class SwinTransformer(nn.Module):
+    """ Swin Transformer backbone.
+        A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
+          https://arxiv.org/pdf/2103.14030
 
     Args:
-        img_size (int | tuple(int)): Input image size. Default 224
-        patch_size (int | tuple(int)): Patch size. Default: 4
-        in_chans (int): Number of input image channels. Default: 3
-        num_classes (int): Number of classes for classification head. Default: 1000
-        embed_dim (int): Patch embedding dimension. Default: 96
-        depths (tuple(int)): Depth of each Swin MLP layer.
-        num_heads (tuple(int)): Number of attention heads in different layers.
-        window_size (int): Window size. Default: 7
-        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim. Default: 4
-        drop_rate (float): Dropout rate. Default: 0
-        drop_path_rate (float): Stochastic depth rate. Default: 0.1
+        pretrain_img_size (int): Input image size for training the pretrained model,
+            used in absolute postion embedding. Default 224.
+        patch_size (int | tuple(int)): Patch size. Default: 4.
+        in_chans (int): Number of input image channels. Default: 3.
+        embed_dim (int): Number of linear projection output channels. Default: 96.
+        depths (tuple[int]): Depths of each Swin Transformer stage.
+        num_heads (tuple[int]): Number of attention head of each stage.
+        window_size (int): Window size. Default: 7.
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim. Default: 4.
+        qkv_bias (bool): If True, add a learnable bias to query, key, value. Default: True
+        qk_scale (float): Override default qk scale of head_dim ** -0.5 if set.
+        drop_rate (float): Dropout rate.
+        attn_drop_rate (float): Attention dropout rate. Default: 0.
+        drop_path_rate (float): Stochastic depth rate. Default: 0.2.
         norm_layer (nn.Module): Normalization layer. Default: nn.LayerNorm.
-        ape (bool): If True, add absolute position embedding to the patch embedding. Default: False
-        patch_norm (bool): If True, add normalization after patch embedding. Default: True
-        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False
+        ape (bool): If True, add absolute position embedding to the patch embedding. Default: False.
+        patch_norm (bool): If True, add normalization after patch embedding. Default: True.
+        out_indices (Sequence[int]): Output from which stages.
+        frozen_stages (int): Stages to be frozen (stop grad and set eval mode).
+            -1 means not freezing any parameters.
+        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False.
     """
 
-    def __init__(self, pretrain_img_size=224, patch_size=4, in_chans=3,
-                 embed_dim=96, depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24],
-                 window_size=7, mlp_ratio=4., drop_rate=0., drop_path_rate=0.2,
-                 norm_layer=nn.LayerNorm, ape=False, patch_norm=True, out_indices=[1, 2, 3], frozen_stages=-1,
-                 use_checkpoint=False, pos_dim=768):
+    def __init__(
+            self,
+            pretrain_img_size=224,
+            patch_size=4,
+            in_chans=3,
+            embed_dim=96,
+            depths=[2, 2, 6, 2],
+            num_heads=[3, 6, 12, 24],
+            window_size=7,
+            mlp_ratio=4.,
+            qkv_bias=True,
+            qk_scale=None,
+            drop_rate=0.,
+            attn_drop_rate=0.,
+            drop_path_rate=0.2,
+            norm_layer=nn.LayerNorm,
+            ape=False,
+            patch_norm=True,
+            out_indices=[1, 2, 3],
+            frozen_stages=-1,
+            use_checkpoint=False,
+            pos_dim=768):
         super().__init__()
 
         self.pretrain_img_size = pretrain_img_size
         self.num_layers = len(depths)
-        self.embed_dim = embed_dim
-        self.ape = ape
-        self.patch_norm = patch_norm
+        self.embed_dim = embed_dim 
+        self.ape = ape  # False
+        self.patch_norm = patch_norm  # True
         self.out_indices = out_indices  # [1,2,3] <- but not used
         self.frozen_stages = frozen_stages  # -1
 
@@ -483,7 +567,6 @@ class SwinMLP(nn.Module):
             embed_dim=embed_dim,
             norm_layer=norm_layer if self.patch_norm else None)  # LayerNorm
 
-        # absolute position embedding
         if self.ape:
             pretrain_img_size = to_2tuple(pretrain_img_size)
             patch_size = to_2tuple(patch_size)
@@ -500,18 +583,23 @@ class SwinMLP(nn.Module):
 
         # build layers
         self.layers = nn.ModuleList()
-        for i_layer in range(self.num_layers):
-            layer = BasicLayer(dim=int(embed_dim * 2 ** i_layer),
-                               depth=depths[i_layer],
-                               num_heads=num_heads[i_layer],
-                               window_size=window_size,
-                               mlp_ratio=self.mlp_ratio,
-                               drop=drop_rate,
-                               drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
-                               norm_layer=norm_layer,
-                               downsample=partial(PatchMerging, pos_dim=pos_dim) if (i_layer < self.num_layers) else None,
-                               last=None if (i_layer < self.num_layers - 1) else True,
-                               use_checkpoint=use_checkpoint)
+        for i_layer in range(self.num_layers):  # has 4 stages/layers
+            layer = BasicLayer(
+                dim=int(embed_dim * 2**i_layer),
+                depth=depths[i_layer],
+                num_heads=num_heads[i_layer],
+                window_size=window_size,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                qk_scale=qk_scale,
+                drop=drop_rate,
+                attn_drop=attn_drop_rate,
+                drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
+                norm_layer=norm_layer,
+                # Adding the downsample (H/64, W/64)
+                downsample=partial(PatchMerging, pos_dim=pos_dim) if (i_layer < self.num_layers) else None,
+                last=None if (i_layer < self.num_layers - 1) else True,
+                use_checkpoint=use_checkpoint)
             self.layers.append(layer)
 
         num_features = [int(embed_dim * 2**i) for i in range(self.num_layers)]
@@ -585,7 +673,7 @@ class SwinMLP(nn.Module):
 
     def train(self, mode=True):
         """Convert the model into training mode while keep layers freezed."""
-        super(SwinMLP, self).train(mode)
+        super(SwinTransformer, self).train(mode)
         self._freeze_stages()
 
     # not working in the current version
@@ -597,10 +685,11 @@ class SwinMLP(nn.Module):
         flops += self.num_features * self.patches_resolution[0] * self.patches_resolution[1] // (2**self.num_layers)
         flops += self.num_features * self.num_classes
         return flops
-    
+
+
 def swin_base_win7_384(pretrained=None, pos_dim=1024, **kwargs):
     pos_dim = 1024 if pos_dim is None else pos_dim
-    model = SwinMLP(pretrain_img_size=[384, 384],
+    model = SwinTransformer(pretrain_img_size=[384, 384],
                             embed_dim=128,
                             depths=[2, 2, 18, 2],
                             num_heads=[4, 8, 16, 32],
@@ -616,13 +705,10 @@ def swin_base_win7_384(pretrained=None, pos_dim=1024, **kwargs):
         if pretrained == 'imagenet':
             path = "pretrained_weights/swin_base_patch4_window7_384_22k.pth"
             path = os.path.join(os.environ['HOME'], 'checkpoints/eccv', path)
-            directory = os.path.dirname(path)
-            if not os.path.exists(directory):
-                os.makedirs(directory)
             if not os.path.exists(path):
                 torch.hub._download_url_to_file(
                     url=
-                    "https://github.com/SwinTransformer/storage/releases/download/v1.0.5/swin_mlp_base_patch4_window7_224.pth",
+                    "https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_base_patch4_window12_384_22k.pth",
                     dst=path)
             checkpoint = torch.load(path, map_location="cpu")
             model.load_state_dict(checkpoint["model"], strict=False)
