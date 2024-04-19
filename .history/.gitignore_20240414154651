@@ -2,4 +2,3 @@ scripts
 **/__pycache__
 models/ops/*
 outputs
-data/*
