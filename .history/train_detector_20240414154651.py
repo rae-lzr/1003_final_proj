@@ -1,6 +1,3 @@
-import time
-import json
-import os
 import hydra
 from omegaconf import DictConfig, OmegaConf
 from hydra.core.hydra_config import HydraConfig
@@ -134,7 +131,6 @@ def main(gpu, config, overrides):
     optimizers, schedulers = build_optimizers_schedulers(model_without_ddp, config)
 
     start_epoch = 0
-    epoch_durations = []
     if config.exp.checkpoint != "" and os.path.exists(config.exp.checkpoint):
         checkpoint = torch.load(config.exp.checkpoint, map_location=device)
 
