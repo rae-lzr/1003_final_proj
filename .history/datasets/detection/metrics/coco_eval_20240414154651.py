@@ -5,7 +5,7 @@ import numpy as np
 import copy
 import time
 import torch
-# import torch._six
+import torch._six
 
 # from pycocotools.cocoeval import COCOeval
 from .cocoeval import COCOeval # Q: edit
@@ -250,8 +250,7 @@ def loadRes(self, resFile):
 
     # print('Loading and preparing results...')
     # tic = time.time()
-    # if isinstance(resFile, torch._six.string_classes):
-    if isinstance(resFile, str):
+    if isinstance(resFile, torch._six.string_classes):
         anns = json.load(open(resFile))
     elif type(resFile) == np.ndarray:
         anns = self.loadNumpyAnnotations(resFile)
