@@ -616,16 +616,17 @@ def swin_base_win7_384(pretrained=None, pos_dim=1024, **kwargs):
     if pretrained is not None:
         if pretrained == 'imagenet':
             path = "pretrained_weights/swin_mlp_base_patch4_window7_224.pth"
-            path = os.path.join(os.environ['HOME'], 'checkpoints/eccv', path)
+            # path = os.path.join(os.environ['HOME'], 'checkpoints/eccv', path)
+            path = os.path.join('/scratch/zl5162/1003', 'checkpoints/eccv', path)
             directory = os.path.dirname(path)
             if not os.path.exists(directory):
                 os.makedirs(directory)
-            if not os.path.exists(path):
-                torch.hub.load_state_dict_from_url(
-                    url=
-                    "https://github.com/SwinTransformer/storage/releases/download/v1.0.5/swin_mlp_base_patch4_window7_224.pth",
-                    progress=True)
-            checkpoint = torch.load(path, map_location="cpu")
+            # if not os.path.exists(path):
+            #     torch.hub.load_state_dict_from_url(
+            #         url=
+            #         "https://github.com/SwinTransformer/storage/releases/download/v1.0.5/swin_mlp_base_patch4_window7_224.pth",
+            #         progress=True)
+            checkpoint = torch.load(path, map_location="cpu", weights_only=True)
             model.load_state_dict(checkpoint["model"], strict=False)
             print('Load the backbone pretrained on ImageNet 22K')
         else:
