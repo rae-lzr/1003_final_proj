@@ -78,7 +78,8 @@ optimizer:
 
 hydra:
   run:
-    dir: ${oc.env:HOME}/checkpoints/ecaptioner/detection/${exp.save_dir} # eccv
+    # dir: /scratch/$USER/1003/checkpoints/ecaptioner/detection/${exp.save_dir} # eccv
+    dir: /scratch/zl5162/1003/checkpoints/ecaptioner/detection
   output_subdir: ./ # directory for saving the yaml configs
   job:
     config:
